@@ -144,6 +144,38 @@ static bool DirectoryInSection(PIMAGE_SECTION_HEADER Section, PIMAGE_DEBUG_DIREC
     }
 }
 
+// Determines if an RVA is within a section.
+template <typename TRva> static bool TableRvaInSection(PIMAGE_SECTION_HEADER Section, TRva rva) {
+    if ((Section->VirtualAddress >= rva) && (Section->VirtualAddress < rva + sizeof(TRva)))
+        return true;
+
+    if ((rva >= Section->VirtualAddress) && (rva < Section->VirtualAddress + Section->Misc.VirtualSize))
+        return true;
+
+    return false;
+}
+
+// Zeros out all possible IAT entries.
+template <typename TRva> static void ClearIAT(const byte* base, const PIMAGE_SECTION_HEADER Section, PIMAGE_IMPORT_DESCRIPTOR Descriptor) {
+    // Zero out the TimeDateStamp, it might have a DLL timestamp of the imported DLL in it
+    Descriptor->TimeDateStamp = 0;
+    // Get the rvaNames and rvaAddrs.
+    auto rvarvaNames = Descriptor->OriginalFirstThunk;
+    auto rvarvaAddrs = Descriptor->FirstThunk;
+
+    if (!TableRvaInSection(Section, rvarvaNames)) return;
+    if (!TableRvaInSection(Section, rvarvaAddrs)) return;
+
+    auto pNames = (TRva*)&base[rvarvaNames - Section->VirtualAddress];
+    auto pAddrs = (TRva*)&base[rvarvaAddrs - Section->VirtualAddress];
+    // Walk the rvas and zero out the addresses if possible.
+    for (; *pNames != 0; pNames++, pAddrs++, rvarvaNames += sizeof(TRva), rvarvaAddrs += sizeof(TRva)) {
+        if (!TableRvaInSection(Section, rvarvaNames)) continue;
+        if (!TableRvaInSection(Section, rvarvaAddrs)) continue;
+        *pAddrs = 0;
+    }
+}
+
 // Compares PEs.
 static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, const UINT64 length2) {
     UINT64 ret = 0;
@@ -176,6 +208,12 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
     PIMAGE_DATA_DIRECTORY pDirDebug2 = nullptr;
     PIMAGE_DATA_DIRECTORY pDirExport1 = nullptr;
     PIMAGE_DATA_DIRECTORY pDirExport2 = nullptr;
+    PIMAGE_DATA_DIRECTORY pDirImport1 = nullptr;
+    PIMAGE_DATA_DIRECTORY pDirImport2 = nullptr;
+
+    bool IsBound1 = false;
+    bool IsBound2 = false;
+
 
     switch (pPe1->OptionalHeader.Magic) {
     case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
@@ -190,6 +228,12 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
 
         pDirExport1 = GetDataDirectory<IMAGE_NT_HEADERS32>(pPe1, IMAGE_DIRECTORY_ENTRY_EXPORT);
         pDirExport2 = GetDataDirectory<IMAGE_NT_HEADERS32>(pPe2, IMAGE_DIRECTORY_ENTRY_EXPORT);
+
+        pDirImport1 = GetDataDirectory<IMAGE_NT_HEADERS32>(pPe1, IMAGE_DIRECTORY_ENTRY_IMPORT);
+        pDirImport2 = GetDataDirectory<IMAGE_NT_HEADERS32>(pPe2, IMAGE_DIRECTORY_ENTRY_IMPORT);
+
+        IsBound1 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe1, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
+        IsBound2 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe2, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
         break;
     case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
         pDirRsrc1 = GetDataDirectory<IMAGE_NT_HEADERS64>(pPe1, IMAGE_DIRECTORY_ENTRY_RESOURCE);
@@ -203,6 +247,12 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
 
         pDirExport1 = GetDataDirectory<IMAGE_NT_HEADERS64>(pPe1, IMAGE_DIRECTORY_ENTRY_EXPORT);
         pDirExport2 = GetDataDirectory<IMAGE_NT_HEADERS64>(pPe2, IMAGE_DIRECTORY_ENTRY_EXPORT);
+
+        pDirImport1 = GetDataDirectory<IMAGE_NT_HEADERS64>(pPe1, IMAGE_DIRECTORY_ENTRY_IMPORT);
+        pDirImport2 = GetDataDirectory<IMAGE_NT_HEADERS64>(pPe2, IMAGE_DIRECTORY_ENTRY_IMPORT);
+
+        IsBound1 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe1, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
+        IsBound2 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe2, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
         break;
     }
 
@@ -258,22 +308,26 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
         auto pData1 = &p1[Offset1];
         auto pData2 = &p2[Offset2];
 
-        // If this section contains the debug directory then skip them.
+        // If this section contains the debug directory then all data related to that will need to be zeroed.
         auto Debug1 = DirectoryInSection(&pSect1[i], pDirDebug1);
         auto Debug2 = DirectoryInSection(&pSect2[i], pDirDebug2);
         // If the debug directory isn't in the same section then return SectionCountDifferent
         if (Debug1 != Debug2) return COMPARE_DIFF_SECTIONS << COMPARE_SECTION_BITS;
 
-        // If this section contains the export directory then that needs to be skipped too.
+        // If this section contains the export directory then its TimeDateStamp needs to be zeroed.
         auto Export1 = DirectoryInSection(&pSect1[i], pDirExport1);
         auto Export2 = DirectoryInSection(&pSect2[i], pDirExport2);
-        // If the debug directory isn't in the same section then return SectionCountDifferent
+        // If the export directory isn't in the same section then return SectionCountDifferent
         if (Export1 != Export2) return COMPARE_DIFF_SECTIONS << COMPARE_SECTION_BITS;
+
+        // If this section contains the import directory and the imports are bound: the IAT needs to be zeroed.
+        auto Import1 = IsBound1 && DirectoryInSection(&pSect1[i], pDirImport1);
+        auto Import2 = IsBound2 && DirectoryInSection(&pSect2[i], pDirImport2);
 
         // If either are in this section then reallocate.
         std::unique_ptr<BYTE[]> pAllocated1 = nullptr;
         std::unique_ptr<BYTE[]> pAllocated2 = nullptr;
-        if (Debug1 || Export1) {
+        if (Debug1 || Export1 || Import1 || Import2) {
             // Needs reallocating.
             pAllocated1 = std::make_unique<BYTE[]>(Length);
             pAllocated2 = std::make_unique<BYTE[]>(Length);
@@ -290,6 +344,38 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
 
             pExport1->TimeDateStamp = 0;
             pExport2->TimeDateStamp = 0;
+        }
+
+        if (Import1) {
+            // Zero out the IAT for first PE
+            auto pImport = (const PIMAGE_IMPORT_DESCRIPTOR)&pAllocated1[pDirImport1->VirtualAddress - pSect1[i].VirtualAddress];
+            
+            for (SIZE_T desc = 0; desc < pDirImport1->Size / sizeof(IMAGE_IMPORT_DESCRIPTOR); desc++) {
+                switch (pPe1->OptionalHeader.Magic) {
+                case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
+                    ClearIAT<UINT32>(pAllocated1.get(), &pSect1[i], &pImport[desc]);
+                    break;
+                case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
+                    ClearIAT<UINT64>(pAllocated1.get(), &pSect1[i], &pImport[desc]);
+                    break;
+                }
+            }
+        }
+
+        if (Import2) {
+            // Zero out the IAT for second PE
+            auto pImport = (const PIMAGE_IMPORT_DESCRIPTOR)&pAllocated2[pDirImport2->VirtualAddress - pSect2[i].VirtualAddress];
+
+            for (SIZE_T desc = 0; desc < pDirImport2->Size / sizeof(IMAGE_IMPORT_DESCRIPTOR); desc++) {
+                switch (pPe2->OptionalHeader.Magic) {
+                case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
+                    ClearIAT<UINT32>(pAllocated2.get(), &pSect2[i], &pImport[desc]);
+                    break;
+                case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
+                    ClearIAT<UINT64>(pAllocated2.get(), &pSect2[i], &pImport[desc]);
+                    break;
+                }
+            }
         }
 
         if (Debug1) {

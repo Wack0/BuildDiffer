@@ -11,7 +11,7 @@ For each file in the first folder, recursively:
 - If it doesn't exist in the second folder, do nothing.
 - If the file is not a supported executable, do nothing.
 - If the file in the second folder is not in the same executable format, do nothing.
-- Compare all text/rodata/data sections of both executables (ignore `.rsrc`; zero out `IMAGE_EXPORT_DIRECTORY.TimeDateStamp` and all `IMAGE_DEBUG_DIRECTORY` blocks in PE). If they are equal, do nothing.
+- Compare all text/rodata/data sections of both executables (ignore `.rsrc`; zero out `IMAGE_EXPORT_DIRECTORY.TimeDateStamp` and all `IMAGE_DEBUG_DIRECTORY` blocks in PE; for PE files with bound imports, the IAT is also zeroed). If they are equal, do nothing.
 - Print the executable type, the filename, the section categories that are different, and a list of section numbers with differences.
 
 For section categories: `text` means text/code, `rdata` means read-only data, `data` means read-write data, `sections` means section count changed, or section flags changed.
