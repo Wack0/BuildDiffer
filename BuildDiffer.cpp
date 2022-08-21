@@ -801,7 +801,9 @@ static void DiffFiles(String^ dir1, String^ dir2, String^ baseFolder) {
 
 enum {
     WIXSXS_DIR_PARTS_LENGTH = 6,
-    WINSXS_HASH_HEXITS_LENGTH = 16
+    WINSXS_HASH_HEXITS_LENGTH = 16,
+    WINSXS_EARLY_DIR_PARTS_LENGTH = 2,
+    WIXSXS_EARLY_HASH_HEXITS_LENGTH = 8
 };
 
 // Diffs all executable files in two directories
@@ -814,16 +816,26 @@ static void Diff(String^ dir1, String^ dir2, String^ baseFolder = String::Empty)
             // Does this look like a winsxs package directory?
             auto winsxs = folderName->Split(L'_');
             // arch_name_hash_version_lang_hash
-            if (winsxs->Length < WIXSXS_DIR_PARTS_LENGTH) continue;
-            if (winsxs[winsxs->Length - 1]->Length != WINSXS_HASH_HEXITS_LENGTH) continue;
-            if (winsxs[winsxs->Length - 4]->Length != WINSXS_HASH_HEXITS_LENGTH) continue;
-            // set up the search wildcard
-            winsxs[winsxs->Length - 1] = "*";
-            winsxs[winsxs->Length - 3] = "*";
+            if (winsxs->Length >= WIXSXS_DIR_PARTS_LENGTH) {
+                if (winsxs[winsxs->Length - 1]->Length != WINSXS_HASH_HEXITS_LENGTH) continue;
+                if (winsxs[winsxs->Length - 4]->Length != WINSXS_HASH_HEXITS_LENGTH) continue;
+                // set up the search wildcard
+                winsxs[winsxs->Length - 1] = "*";
+                winsxs[winsxs->Length - 3] = "*";
+            }
+            // name_hash, earlier-style unstaged WIM dirnames
+            else if (winsxs->Length >= WINSXS_EARLY_DIR_PARTS_LENGTH) {
+                if (winsxs[winsxs->Length - 1]->Length != WIXSXS_EARLY_HASH_HEXITS_LENGTH) continue;
+                // set up the search wildcard
+                winsxs[winsxs->Length - 1] = "*";
+            }
+            else {
+                continue;
+            }
             auto winsxsStr = String::Join("_", winsxs);
             auto dirs = Directory::GetDirectories(dir2, winsxsStr);
             // there might be more than one directory found, if some winsxs dirs are being compared.
-            // this functionality is for comparing update packages.
+            // this functionality is for comparing update packages or unstaged WIMs
             if (dirs->Length != 1) continue;
             Diff(folder, dirs[0], Path::Combine(baseFolder, winsxsStr));
             continue;
