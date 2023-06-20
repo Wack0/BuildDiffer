@@ -191,7 +191,7 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
 
     // Get pointers to first section header
     auto pSect1 = (const PIMAGE_SECTION_HEADER)&p1[pMz1->e_lfanew + pPe1->FileHeader.SizeOfOptionalHeader + offsetof(IMAGE_NT_HEADERS32, OptionalHeader)];
-    auto pSect2 = (const PIMAGE_SECTION_HEADER)&p1[pMz2->e_lfanew + pPe2->FileHeader.SizeOfOptionalHeader + offsetof(IMAGE_NT_HEADERS32, OptionalHeader)];
+    auto pSect2 = (const PIMAGE_SECTION_HEADER)&p2[pMz2->e_lfanew + pPe2->FileHeader.SizeOfOptionalHeader + offsetof(IMAGE_NT_HEADERS32, OptionalHeader)];
 
     static const DWORD CharacteristicsTable[] = {
         IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE, // .text
