@@ -94,6 +94,11 @@ enum {
     LE_SECTION_PRIVILEGED = BIT(15)
 };
 
+// Gets the image base from a PE file.
+template <typename TNtHeaders> static ULONGLONG GetImageBase(PIMAGE_NT_HEADERS pPe) {
+    return ((TNtHeaders*)pPe)->OptionalHeader.ImageBase;
+}
+
 // Gets a data directory from a PE file.
 template <typename TNtHeaders> static PIMAGE_DATA_DIRECTORY GetDataDirectory(PIMAGE_NT_HEADERS pPe, size_t DirectoryEntry) {
     if (((TNtHeaders*)pPe)->OptionalHeader.NumberOfRvaAndSizes < DirectoryEntry) return nullptr;
@@ -191,6 +196,126 @@ template <typename TRva> static void ClearIAT(const byte* base, const PIMAGE_SEC
     }
 }
 
+// Relocate a PE section.
+static void RelocateSectionPE(
+    const byte* pBase,
+    const PIMAGE_NT_HEADERS pPe,
+    const PIMAGE_SECTION_HEADER pSects,
+    const PIMAGE_DATA_DIRECTORY pDirReloc,
+    byte* pRelocBuf,
+    const ULONGLONG RelocatedBase,
+    const ULONGLONG ImageBase,
+    WORD sectionIdx)
+{
+    // Get the section of the relocation directory.
+    WORD relocIdx = 0;
+    for (; relocIdx < pPe->FileHeader.NumberOfSections; relocIdx++) {
+        if (DirectoryInSection(&pSects[relocIdx], pDirReloc)) break;
+    }
+    if (relocIdx == pPe->FileHeader.NumberOfSections) return; // couldn't find it
+
+    auto pReloc = &pBase[pSects[relocIdx].PointerToRawData + pDirReloc->VirtualAddress - pSects[relocIdx].VirtualAddress];
+    auto pRelocEnd = &pReloc[pDirReloc->Size];
+
+    const ULONGLONG Difference = RelocatedBase - ImageBase;
+    const auto Machine = pPe->FileHeader.Machine;
+
+    while (pReloc < pRelocEnd) {
+        auto pBaseReloc = (PIMAGE_BASE_RELOCATION)pReloc;
+        // is this RVA base inside the wanted section? if not, don't even bother processing relocation entries
+        auto pNextReloc = &pReloc[pBaseReloc->SizeOfBlock];
+        if (RvaInSection(&pSects[sectionIdx], pBaseReloc->VirtualAddress, 0)) {
+            for (auto pRelocEntry = (PWORD)&pReloc[sizeof(*pBaseReloc)]; (SIZE_T)pRelocEntry < (SIZE_T)pNextReloc; pRelocEntry++) {
+                auto type = (*pRelocEntry >> 12) & 0xf;
+                auto offset = *pRelocEntry & 0xfff;
+
+                auto pointer = &pRelocBuf[pBaseReloc->VirtualAddress + offset - pSects[sectionIdx].VirtualAddress];
+                switch (type) {
+                case IMAGE_REL_BASED_ABSOLUTE:
+                    // The base relocation is skipped. This type can be used to pad a block.
+                    break;
+                case IMAGE_REL_BASED_HIGH:
+                    // The base relocation adds the high 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the high value of a 32-bit word.
+                {
+                    if (!RvaInSection(&pSects[sectionIdx], pBaseReloc->VirtualAddress + offset, sizeof(WORD))) continue;
+                    UNALIGNED auto ptr16 = (PWORD)pointer;
+                    ULONG val32 = (*ptr16 << 16) + (ULONG)Difference;
+                    *ptr16 += (WORD)(val32 >> 16);
+                    break;
+                }
+                case IMAGE_REL_BASED_LOW:
+                    // The base relocation adds the low 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the low half of a 32-bit word.
+                {
+                    if (!RvaInSection(&pSects[sectionIdx], pBaseReloc->VirtualAddress + offset, sizeof(WORD))) continue;
+                    UNALIGNED auto ptr16 = (PWORD)pointer;
+                    ULONG val32 = *ptr16 + (ULONG)Difference;
+                    *ptr16 += (WORD)(val32);
+                    break;
+                }
+                case IMAGE_REL_BASED_HIGHLOW:
+                    // The base relocation applies all 32 bits of the difference to the 32-bit field at offset.
+                {
+                    if (!RvaInSection(&pSects[sectionIdx], pBaseReloc->VirtualAddress + offset, sizeof(DWORD))) continue;
+                    UNALIGNED auto ptr32 = (PDWORD)pointer;
+                    *ptr32 += (ULONG)(Difference);
+                    break;
+                }
+                case IMAGE_REL_BASED_HIGHADJ:
+                    // The base relocation adds the high 16 bits of the difference to the 16-bit field at offset.
+                    // The 16-bit field represents the high value of a 32-bit word.
+                    // The low 16 bits of the 32-bit value are stored in the 16-bit word that follows this base relocation.
+                    // This means that this base relocation occupies two slots.
+                {
+                    if (!RvaInSection(&pSects[sectionIdx], pBaseReloc->VirtualAddress + offset, sizeof(WORD))) continue;
+                    UNALIGNED auto ptr16 = (PDWORD)pointer;
+                    ULONG val32 = *ptr16 << 16;
+                    pRelocEntry++;
+                    if ((SIZE_T)pRelocEntry >= (SIZE_T)pNextReloc) continue; // invalid relocation entry?!
+                    val32 += *pRelocEntry + (ULONG)Difference + 0x8000;
+                    *ptr16 += (WORD)(val32 >> 16);
+                    break;
+                }
+                case IMAGE_REL_BASED_MACHINE_SPECIFIC_5:
+                {
+                    // TODO: machine specific, ignore for now
+                    break;
+                }
+                case IMAGE_REL_BASED_RESERVED:
+                    break; // should never be encountered
+                case IMAGE_REL_BASED_MACHINE_SPECIFIC_7:
+                {
+                    // TODO: machine specific, ignore for now
+                    break;
+                }
+                case IMAGE_REL_BASED_MACHINE_SPECIFIC_8:
+                {
+                    // TODO: machine specific, ignore for now
+                    break;
+                }
+                case IMAGE_REL_BASED_MACHINE_SPECIFIC_9:
+                {
+                    // TODO: machine specific, ignore for now
+                    break;
+                }
+                case IMAGE_REL_BASED_DIR64:
+                    // The base relocation applies the difference to the 64-bit field at offset.
+                {
+                    if (!RvaInSection(&pSects[sectionIdx], pBaseReloc->VirtualAddress + offset, sizeof(ULONGLONG))) continue;
+                    UNALIGNED auto ptr64 = (PULONGLONG)pointer;
+                    *ptr64 += Difference;
+                    break;
+                }
+
+                }
+            }
+
+        }
+
+        // increment pReloc to the next block
+        pReloc = pNextReloc;
+    }
+}
+
 // Compares PEs.
 static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, const UINT64 length2) {
     UINT64 ret = 0;
@@ -214,7 +339,7 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
         IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA, // .data
     };
 
-    // Get the resource and relocations directory.
+    // Get the required image directories. Also get the ImageBase for both PEs.
     PIMAGE_DATA_DIRECTORY pDirRsrc1 = nullptr;
     PIMAGE_DATA_DIRECTORY pDirRsrc2 = nullptr;
     PIMAGE_DATA_DIRECTORY pDirReloc1 = nullptr;
@@ -225,6 +350,9 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
     PIMAGE_DATA_DIRECTORY pDirExport2 = nullptr;
     PIMAGE_DATA_DIRECTORY pDirImport1 = nullptr;
     PIMAGE_DATA_DIRECTORY pDirImport2 = nullptr;
+    ULONGLONG ImageBase1 = 0;
+    ULONGLONG ImageBase2 = 0;
+    PULONGLONG ImageBaseToRelocate = nullptr;
 
     bool IsBound1 = false;
     bool IsBound2 = false;
@@ -249,6 +377,9 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
 
         IsBound1 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe1, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
         IsBound2 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe2, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
+
+        ImageBase1 = GetImageBase<IMAGE_NT_HEADERS32>(pPe1);
+        ImageBase2 = GetImageBase<IMAGE_NT_HEADERS32>(pPe2);
         break;
     case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
         pDirRsrc1 = GetDataDirectory<IMAGE_NT_HEADERS64>(pPe1, IMAGE_DIRECTORY_ENTRY_RESOURCE);
@@ -268,7 +399,17 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
 
         IsBound1 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe1, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
         IsBound2 = !DirectoryIsNull(GetDataDirectory<IMAGE_NT_HEADERS32>(pPe2, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT));
+
+        ImageBase1 = GetImageBase<IMAGE_NT_HEADERS64>(pPe1);
+        ImageBase2 = GetImageBase<IMAGE_NT_HEADERS64>(pPe2);
         break;
+    }
+
+    // Calculate the image base to relocate.
+    // Basically: if ImageBase1 is NULL then relocate the first one if possible, otherwise relocate the second one if possible.
+    if (ImageBase1 != ImageBase2) {
+        if (ImageBase1 == 0 || (pDirReloc2->Size == 0 && pDirReloc1->Size != 0)) ImageBaseToRelocate = &ImageBase1;
+        else if (pDirReloc2->Size != 0) ImageBaseToRelocate = &ImageBase2;
     }
 
     bool noSectionsCompared = true;
@@ -339,7 +480,7 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
         auto Import1 = DirectoryInSection(&pSect1[i], pDirImport1);
         auto Import2 = DirectoryInSection(&pSect2[i], pDirImport2);
 
-        // If either are in this section then reallocate.
+        // If either are in this section, or image base doesn't match (therefore relocation might need to be performed) then reallocate.
         std::unique_ptr<BYTE[]> pAllocated1 = nullptr;
         std::unique_ptr<BYTE[]> pAllocated2 = nullptr;
         if (Debug1 || Export1 || Import1 || Import2) {
@@ -350,6 +491,29 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
             memcpy(pAllocated2.get(), pData2, Length);
             pData1 = pAllocated1.get();
             pData2 = pAllocated2.get();
+        }
+        else if (ImageBaseToRelocate != nullptr) {
+            // Needs reallocating, but only for the relocated section.
+            if (ImageBaseToRelocate == &ImageBase1) {
+                pAllocated1 = std::make_unique<BYTE[]>(Length);
+                memcpy(pAllocated1.get(), pData1, Length);
+                pData1 = pAllocated1.get();
+            }
+            else {
+                pAllocated2 = std::make_unique<BYTE[]>(Length);
+                memcpy(pAllocated2.get(), pData2, Length);
+                pData2 = pAllocated2.get();
+            }
+        }
+
+        if (ImageBaseToRelocate != nullptr) {
+            // Relocate the section.
+            if (ImageBaseToRelocate == &ImageBase1) {
+                RelocateSectionPE(p1, pPe1, pSect1, pDirReloc1, pAllocated1.get(), ImageBase2, ImageBase1, i);
+            }
+            else {
+                RelocateSectionPE(p2, pPe2, pSect2, pDirReloc2, pAllocated2.get(), ImageBase1, ImageBase2, i);
+            }
         }
 
         if (Export1) {
