@@ -144,9 +144,9 @@ static bool DirectoryInSection(PIMAGE_SECTION_HEADER Section, PIMAGE_DEBUG_DIREC
     }
 }
 
-// Determines if an RVA is within a section.
-template <typename TRva> static bool TableRvaInSection(PIMAGE_SECTION_HEADER Section, TRva rva) {
-    if ((Section->VirtualAddress >= rva) && (Section->VirtualAddress < rva + sizeof(TRva)))
+// Determines if an RVA is within a section, using a specified length.
+template <typename TRva> static bool RvaInSection(PIMAGE_SECTION_HEADER Section, TRva rva, SIZE_T length) {
+    if ((Section->VirtualAddress >= rva) && (Section->VirtualAddress < rva + length))
         return true;
 
     if ((rva >= Section->VirtualAddress) && (rva < Section->VirtualAddress + Section->Misc.VirtualSize))
@@ -155,24 +155,39 @@ template <typename TRva> static bool TableRvaInSection(PIMAGE_SECTION_HEADER Sec
     return false;
 }
 
+// Determines if an RVA is within a section.
+template <typename TRva> static bool TableRvaInSection(PIMAGE_SECTION_HEADER Section, TRva rva) {
+    return RvaInSection(Section, rva, sizeof(TRva));
+}
+
 // Zeros out all possible IAT entries.
-template <typename TRva> static void ClearIAT(const byte* base, const PIMAGE_SECTION_HEADER Section, PIMAGE_IMPORT_DESCRIPTOR Descriptor) {
+template <typename TRva> static void ClearIAT(const byte* base, const PIMAGE_SECTION_HEADER Section, PIMAGE_IMPORT_DESCRIPTOR Descriptor, bool IsBound) {
     // Zero out the TimeDateStamp, it might have a DLL timestamp of the imported DLL in it
-    Descriptor->TimeDateStamp = 0;
+    if (IsBound) Descriptor->TimeDateStamp = 0;
     // Get the rvaNames and rvaAddrs.
     auto rvarvaNames = Descriptor->OriginalFirstThunk;
     auto rvarvaAddrs = Descriptor->FirstThunk;
 
     if (!TableRvaInSection(Section, rvarvaNames)) return;
-    if (!TableRvaInSection(Section, rvarvaAddrs)) return;
+    if (IsBound && !TableRvaInSection(Section, rvarvaAddrs)) return;
 
     auto pNames = (TRva*)&base[rvarvaNames - Section->VirtualAddress];
     auto pAddrs = (TRva*)&base[rvarvaAddrs - Section->VirtualAddress];
     // Walk the rvas and zero out the addresses if possible.
     for (; *pNames != 0; pNames++, pAddrs++, rvarvaNames += sizeof(TRva), rvarvaAddrs += sizeof(TRva)) {
         if (!TableRvaInSection(Section, rvarvaNames)) continue;
-        if (!TableRvaInSection(Section, rvarvaAddrs)) continue;
-        *pAddrs = 0;
+        if (IsBound) {
+            if (!TableRvaInSection(Section, rvarvaAddrs)) continue;
+            *pAddrs = 0;
+        }
+        // Zero out the ordinals, in case ordinals changed but name didn't.
+        auto name = *pNames;
+        if ((name >> ((sizeof(TRva) * 8) - 1)) == 0) {
+            // this value is really an RVA and not an import by ordinal, so if it's in this section it is safe to zero the hint
+            if (!RvaInSection(Section, name, sizeof(IMAGE_IMPORT_BY_NAME))) continue;
+            auto pImport = (PIMAGE_IMPORT_BY_NAME)&base[name - Section->VirtualAddress];
+            pImport->Hint = 0;
+        }
     }
 }
 
@@ -320,9 +335,9 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
         // If the export directory isn't in the same section then return SectionCountDifferent
         if (Export1 != Export2) return COMPARE_DIFF_SECTIONS << COMPARE_SECTION_BITS;
 
-        // If this section contains the import directory and the imports are bound: the IAT needs to be zeroed.
-        auto Import1 = IsBound1 && DirectoryInSection(&pSect1[i], pDirImport1);
-        auto Import2 = IsBound2 && DirectoryInSection(&pSect2[i], pDirImport2);
+        // If this section contains the import directory: the IAT needs to be zeroed.
+        auto Import1 = DirectoryInSection(&pSect1[i], pDirImport1);
+        auto Import2 = DirectoryInSection(&pSect2[i], pDirImport2);
 
         // If either are in this section then reallocate.
         std::unique_ptr<BYTE[]> pAllocated1 = nullptr;
@@ -353,10 +368,10 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
             for (SIZE_T desc = 0; desc < pDirImport1->Size / sizeof(IMAGE_IMPORT_DESCRIPTOR); desc++) {
                 switch (pPe1->OptionalHeader.Magic) {
                 case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
-                    ClearIAT<UINT32>(pAllocated1.get(), &pSect1[i], &pImport[desc]);
+                    ClearIAT<UINT32>(pAllocated1.get(), &pSect1[i], &pImport[desc], IsBound1);
                     break;
                 case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
-                    ClearIAT<UINT64>(pAllocated1.get(), &pSect1[i], &pImport[desc]);
+                    ClearIAT<UINT64>(pAllocated1.get(), &pSect1[i], &pImport[desc], IsBound1);
                     break;
                 }
             }
@@ -369,10 +384,10 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
             for (SIZE_T desc = 0; desc < pDirImport2->Size / sizeof(IMAGE_IMPORT_DESCRIPTOR); desc++) {
                 switch (pPe2->OptionalHeader.Magic) {
                 case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
-                    ClearIAT<UINT32>(pAllocated2.get(), &pSect2[i], &pImport[desc]);
+                    ClearIAT<UINT32>(pAllocated2.get(), &pSect2[i], &pImport[desc], IsBound2);
                     break;
                 case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
-                    ClearIAT<UINT64>(pAllocated2.get(), &pSect2[i], &pImport[desc]);
+                    ClearIAT<UINT64>(pAllocated2.get(), &pSect2[i], &pImport[desc], IsBound2);
                     break;
                 }
             }
