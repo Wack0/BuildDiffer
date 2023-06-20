@@ -383,8 +383,43 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
             auto pDebugBlock1 = (PIMAGE_DEBUG_DIRECTORY)&pAllocated1[pDirDebug1->VirtualAddress - pSect1[i].VirtualAddress];
             auto pDebugBlock2 = (PIMAGE_DEBUG_DIRECTORY)&pAllocated2[pDirDebug2->VirtualAddress - pSect2[i].VirtualAddress];
 
+            // Find the actual number of debug directories.
+            // Some PEs have extra debug directories past what the PE header says.
+            // There's always(?) a zerofilled entry to end, and to be sure we can check timestamp, all of them should match.
+            // Use the value in the PE header to start with.
+            SIZE_T debugBlockCount1 = pDirDebug1->Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+            SIZE_T debugBlockCount2 = pDirDebug2->Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+            while (true) {
+                // Check if there's still space in this section, if not we know there's no more entries.
+                SIZE_T wantedSize = (SIZE_T)&pDebugBlock1[debugBlockCount1] + sizeof(IMAGE_DEBUG_DIRECTORY) - (SIZE_T)pDebugBlock1;
+                if (Length < wantedSize) break;
+
+                // If the timestamp of this debug directory does not match the first one, there's no more entries.
+                if (pDebugBlock1[0].TimeDateStamp != pDebugBlock1[debugBlockCount1].TimeDateStamp) break;
+
+                // If this debug directory is all zero, there's no more entries.
+                // No need to check that though, as the TimeDateStamp matches, so we know for sure it's not all-zero.
+
+                // This entry looks valid, there's at least one more.
+                debugBlockCount1++;
+            }
+            while (true) {
+                // Check if there's still space in this section, if not we know there's no more entries.
+                SIZE_T wantedSize = (SIZE_T)&pDebugBlock2[debugBlockCount2] + sizeof(IMAGE_DEBUG_DIRECTORY) - (SIZE_T)pDebugBlock2;
+                if (Length < wantedSize) break;
+
+                // If the timestamp of this debug directory does not match the first one, there's no more entries.
+                if (pDebugBlock2[0].TimeDateStamp != pDebugBlock2[debugBlockCount2].TimeDateStamp) break;
+
+                // If this debug directory is all zero, there's no more entries.
+                // No need to check that though, as the TimeDateStamp matches, so we know for sure it's not all-zero.
+
+                // This entry looks valid, there's at least one more.
+                debugBlockCount2++;
+            }
+
             // Walk through each of the debug directories. Zero out all debug blocks in this section.
-            for (SIZE_T idx = 0; idx < pDirDebug1->Size / sizeof(IMAGE_DEBUG_DIRECTORY); idx++) {
+            for (SIZE_T idx = 0; idx < debugBlockCount1; idx++) {
                 // Ensure the debug directory contents are within this section.
                 if (!DirectoryInSection(&pSect1[i], &pDebugBlock1[idx])) continue;
 
@@ -395,9 +430,9 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
                 }
                 memset(&pAllocated1[(SIZE_T)pDebugBlock1[idx].AddressOfRawData - pSect1[i].VirtualAddress], 0, pDebugBlock1[idx].SizeOfData);
             }
-            memset(pDebugBlock1, 0, pDirDebug1->Size);
+            memset(pDebugBlock1, 0, debugBlockCount1 * sizeof(IMAGE_DEBUG_DIRECTORY));
 
-            for (SIZE_T idx = 0; idx < pDirDebug2->Size / sizeof(IMAGE_DEBUG_DIRECTORY); idx++) {
+            for (SIZE_T idx = 0; idx < debugBlockCount2; idx++) {
                 // Ensure the debug directory contents are within this section.
                 if (!DirectoryInSection(&pSect2[i], &pDebugBlock2[idx])) continue;
 
@@ -408,7 +443,7 @@ static UINT64 ComparePEs(const byte* p1, const UINT64 length1, const byte* p2, c
                 }
                 memset(&pAllocated2[(SIZE_T)pDebugBlock2[idx].AddressOfRawData - pSect2[i].VirtualAddress], 0, pDebugBlock2[idx].SizeOfData);
             }
-            memset(pDebugBlock2, 0, pDirDebug2->Size);
+            memset(pDebugBlock2, 0, debugBlockCount2 * sizeof(IMAGE_DEBUG_DIRECTORY));
         }
         // Compare the data, if not equal then set the flag
         if (memcmp(pData1, pData2, Length) != 0) goto SectionIsDifferent;
