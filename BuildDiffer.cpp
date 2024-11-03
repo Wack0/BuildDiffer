@@ -168,7 +168,7 @@ template <typename TRva> static bool TableRvaInSection(PIMAGE_SECTION_HEADER Sec
 // Zeros out all possible IAT entries.
 template <typename TRva> static void ClearIAT(const byte* base, const PIMAGE_SECTION_HEADER Section, PIMAGE_IMPORT_DESCRIPTOR Descriptor, bool IsBound) {
     // Zero out the TimeDateStamp, it might have a DLL timestamp of the imported DLL in it
-    if (IsBound) Descriptor->TimeDateStamp = 0;
+    Descriptor->TimeDateStamp = 0;
     // Get the rvaNames and rvaAddrs.
     auto rvarvaNames = Descriptor->OriginalFirstThunk;
     auto rvarvaAddrs = Descriptor->FirstThunk;
